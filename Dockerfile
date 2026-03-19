@@ -5,8 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc libpq-dev curl && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
-    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt && \
-    pip wheel --no-cache-dir --wheel-dir /wheels psycopg2-binary redis sentry-sdk prometheus-client
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM python:3.11-slim
