@@ -22,4 +22,4 @@ USER appuser
 EXPOSE 8501 8502
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8502/health || exit 1
-CMD ["sh", "-c", "streamlit run ui/app.py --server.port ${PORT:-8501} --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXs
+CMD sh -c "streamlit run ui/app.py --server.port ${PORT:-8501} --server.address 0.0.0.0 --server.headless true"
