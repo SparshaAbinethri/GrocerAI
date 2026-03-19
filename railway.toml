@@ -3,7 +3,6 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "streamlit run ui/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"
