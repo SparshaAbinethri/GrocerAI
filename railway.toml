@@ -1,0 +1,21 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python healthcheck.py & streamlit run ui/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "grocerai"
+
+[[services.variables]]
+name = "APP_ENV"
+value = "production"
+
+[[services.variables]]
+name = "PORT"
+value = "8501"
