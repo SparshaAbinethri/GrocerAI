@@ -146,9 +146,29 @@ def _search_item(
 
         preferred = any(pref in brand for pref in brand_prefs)
 
-        # Extract price safely
+        # DEBUG — log raw item structure to see what Kroger actually returns
+        import logging as _log
+        _log.getLogger(__name__).warning("KROGER RAW ITEM: %s", str(item)[:500])
+
+        # Extract price safely — try all Kroger price fields
         price_info = item.get("items", [{}])[0] if item.get("items") else {}
-        price = float((price_info.get("price") or {}).get("regular", 0) or 0)
+        _log.getLogger(__name__).warning("KROGER PRICE_INFO: %s", str(price_info)[:300])
+        price_obj = price_info.get("price") or {}
+        # DEBUG — log full item structure to see what Kroger returns
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "KROGER RAW ITEM: items=%s price_obj=%s",
+            str(item.get("items", []))[:500],
+            str(price_obj)[:200]
+        )
+        price = float(
+            price_obj.get("regular") or
+            price_obj.get("promo") or
+            price_obj.get("regularPerUnitEstimate") or
+            item.get("regularPrice") or
+            item.get("price") or
+            0
+        )
 
         # Extract size for unit price calculation
         size_str = price_info.get("size", "1")

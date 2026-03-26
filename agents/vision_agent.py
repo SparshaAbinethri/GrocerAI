@@ -23,8 +23,9 @@ _client = OpenAI(api_key=settings.openai_api_key)
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = dedent("""
-    You are a precise kitchen inventory analyst. When given a fridge or pantry photo,
-    identify every visible food item with quantity estimates.
+    You are a kitchen inventory analyst. When given any photo of a fridge, freezer,
+    pantry, or kitchen area, identify ALL visible food items — even if partially visible,
+    dark, or blurry.
 
     Always respond with valid JSON only — no markdown fences, no prose.
     Schema:
@@ -42,9 +43,12 @@ SYSTEM_PROMPT = dedent("""
 
     Guidelines:
     - Use generic names (e.g. "whole milk" not "Organic Valley Whole Milk")
-    - Estimate quantity conservatively (half-full milk = 0.5 carton)
+    - Be GENEROUS — if you can see ANY food item, include it even if partially visible
+    - Include items you can infer from packaging color/shape even if label not visible
     - confidence 0.9+ = clearly visible, 0.5–0.9 = partially visible, <0.5 = inferred
-    - If no image provided or image is not a fridge/pantry, return empty inventory with a note
+    - Dark or blurry photos: still try to identify items, use lower confidence scores
+    - NEVER return empty inventory if there are ANY items visible at all
+    - If image is clearly not a fridge/kitchen, return empty inventory with a note
 """).strip()
 
 USER_PROMPT_WITH_IMAGE = "Analyse this fridge/pantry photo and return the inventory JSON."

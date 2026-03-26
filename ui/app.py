@@ -111,6 +111,12 @@ if "location_id" not in st.session_state:
 if "_found_locs" not in st.session_state:
     st.session_state["_found_locs"] = None
 
+if "_uploaded_image_b64" not in st.session_state:
+    st.session_state["_uploaded_image_b64"] = None
+
+if "_uploaded_image_name" not in st.session_state:
+    st.session_state["_uploaded_image_name"] = None
+
 if "kroger_access_token" not in st.session_state:
     st.session_state["kroger_access_token"] = None
 
@@ -181,7 +187,7 @@ def render_sidebar():
         if st.sidebar.button("✅ Use this store", use_container_width=True, key="use_loc_btn"):
             st.session_state.location_id = chosen_id
             st.session_state["_found_locs"] = None
-            st.rerun()
+            st.sidebar.success(f"✅ Store set! Location ID: {chosen_id}")
 
     location_id = st.sidebar.text_input(
         "Kroger Location ID",
@@ -256,7 +262,15 @@ def render_input_section():
             label_visibility="collapsed",
         )
         if fridge_image:
+            # Save to session state immediately so sidebar reruns don't lose it
+            st.session_state["_uploaded_image_b64"] = _image_to_b64(fridge_image)
+            st.session_state["_uploaded_image_name"] = fridge_image.name
             st.image(fridge_image, caption="Your fridge", use_column_width=True)
+        elif st.session_state.get("_uploaded_image_b64"):
+            st.success(f"✅ Image ready: {st.session_state.get('_uploaded_image_name', 'fridge photo')}")
+            if st.button("🗑️ Remove image", key="remove_img"):
+                st.session_state["_uploaded_image_b64"] = None
+                st.session_state["_uploaded_image_name"] = None
 
     with col2:
         st.subheader("📝 Grocery List")
@@ -280,6 +294,9 @@ def render_input_section():
         )
 
     if run_btn:
+        # DEBUG — remove after testing
+        st.write(f"🔍 DEBUG: fridge_image={fridge_image is not None}, session_image={bool(st.session_state.get('_uploaded_image_b64'))}")
+
         # ── Rate limiting ─────────────────────────────────────────────────────
         _user_id_rl = st.session_state.user_id
         _allowed, _remaining = check_rate_limit(
@@ -293,11 +310,20 @@ def render_input_section():
 
         grocery_list = [line.strip() for line in grocery_text.splitlines() if line.strip()]
 
+        # Capture image FIRST before any state changes
+        # Priority: freshly uploaded file > saved session state
         image_b64 = None
-        if fridge_image:
+        if fridge_image is not None:
             with st.spinner("Processing image..."):
                 image_b64 = _image_to_b64(fridge_image)
+                st.session_state["_uploaded_image_b64"] = image_b64
+        elif st.session_state.get("_uploaded_image_b64"):
+            image_b64 = st.session_state["_uploaded_image_b64"]
 
+        # More debug
+        st.write(f"🔍 DEBUG2: image_b64 is None={image_b64 is None}, length={len(image_b64) if image_b64 else 0}")
+
+        # Clear pipeline state AFTER capturing image
         st.session_state.pipeline_result = None
         st.session_state.cart_items = []
         st.session_state.checked_out = False
@@ -355,7 +381,19 @@ def render_input_section():
             st.code(result_holder["error"])
             st.stop()
 
+        # DEBUG — show what happened
+        st.write("🔍 result_holder keys:", list(result_holder.keys()))
+        if "error" in result_holder:
+            st.error("Pipeline error:")
+            st.code(result_holder["error"])
+            st.stop()
+        if "result" not in result_holder:
+            st.error("Pipeline returned nothing — thread may have timed out")
+            st.stop()
         state: GrocerAIState = result_holder["result"]
+        st.write("🔍 DEBUG vision_raw:", str(state.get("vision_raw_response", "NONE"))[:300])
+        st.write("🔍 DEBUG inventory count:", len(state.get("detected_inventory", [])))
+        st.write("🔍 DEBUG image passed:", bool(state.get("fridge_image_b64")))
         st.session_state.pipeline_result = state
         st.session_state.cart_items = list(state.get("cart_items", []))
 
@@ -691,6 +729,8 @@ def render_results(state: GrocerAIState):
     if st.button("⬅️ Start Over"):
         st.session_state.pipeline_result = None
         st.session_state.cart_items = []
+        st.session_state["_uploaded_image_b64"] = None
+        st.session_state["_uploaded_image_name"] = None
         st.rerun()
 
 

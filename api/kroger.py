@@ -165,7 +165,7 @@ class KrogerClient:
             "client_id": settings.kroger_client_id,
             "redirect_uri": settings.kroger_redirect_uri,
             "response_type": "code",
-            "scope": "openid profile email cart.basic:write product.compact",
+            "scope": "cart.basic:write product.compact",
             "state": state,
         }
         base = "https://api.kroger.com/v1/connect/oauth2/authorize"
