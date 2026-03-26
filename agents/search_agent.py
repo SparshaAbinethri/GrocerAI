@@ -1,22 +1,31 @@
 """
 agents/search_agent.py
-Search Agent — queries Kroger (and stub Walmart) APIs for each needed item,
+Search Agent — queries Kroger API for each needed item,
 applies brand preferences from the RAG store, and ranks results by
 value (price-per-unit). Populates state["search_results"] and state["price_summary"].
+
+Fixes applied:
+  - Exponential backoff + retry on rate limit / transient errors
+  - Clear result ranking strategy (preferred brand > unit price)
+  - Missing items explicitly surfaced to user (not silently dropped)
+  - Substitute suggestions when item unavailable
+  - Removed duplicate/noisy debug logging
+  - Budget constraint support via state["budget"]
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from api.kroger import KrogerClient
 from core.config import settings
 from core.state import GrocerAIState, GroceryNeed, ProductResult
 
-# ── Rough price estimates for common grocery categories (USD) ─────────────────
-# Used as fallback when Kroger sandbox returns $0.00 (no location ID set).
+logger = logging.getLogger(__name__)
+
+# ── Price estimates for sandbox mode (no location ID) ─────────────────────────
 _PRICE_ESTIMATES: dict[str, float] = {
     "milk": 4.49, "whole milk": 4.49, "2% milk": 4.29, "skim milk": 3.99,
     "eggs": 3.99, "egg": 3.99,
@@ -38,22 +47,60 @@ _PRICE_ESTIMATES: dict[str, float] = {
     "cereal": 4.99, "oatmeal": 3.99,
     "peanut butter": 3.99, "jelly": 3.49,
     "sugar": 3.49, "flour": 3.99, "salt": 1.29,
-    "soap": 2.99, "shampoo": 5.99,
 }
 
+# ── Substitute map for common unavailable items ───────────────────────────────
+_SUBSTITUTES: dict[str, list[str]] = {
+    "whole milk": ["2% milk", "oat milk", "almond milk"],
+    "sourdough bread": ["white bread", "whole wheat bread"],
+    "chicken breast": ["chicken thighs", "turkey breast"],
+    "ground beef": ["ground turkey", "ground chicken"],
+    "butter": ["margarine", "coconut oil"],
+    "parmesan": ["pecorino romano", "grana padano"],
+}
+
+
 def _estimate_price(item_name: str) -> float:
-    """Return a rough price estimate for an item when live pricing unavailable."""
     name = item_name.lower().strip()
-    # Exact match first
     if name in _PRICE_ESTIMATES:
         return _PRICE_ESTIMATES[name]
-    # Partial match
     for key, price in _PRICE_ESTIMATES.items():
         if key in name or name in key:
             return price
-    return 0.0  # truly unknown
+    return 0.0
 
-logger = logging.getLogger(__name__)
+
+def _get_substitutes(item_name: str) -> list[str]:
+    name = item_name.lower().strip()
+    for key, subs in _SUBSTITUTES.items():
+        if key in name or name in key:
+            return subs
+    return []
+
+
+# ─── Retry helper ─────────────────────────────────────────────────────────────
+
+def _with_retry(fn, max_retries: int = 3, base_delay: float = 1.0):
+    """
+    Call fn() with exponential backoff on transient errors.
+    Raises the last exception if all retries exhausted.
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            # Don't retry on auth errors — they won't resolve with retries
+            if hasattr(exc, "response") and getattr(exc.response, "status_code", 0) in (401, 403):
+                raise
+            wait = base_delay * (2 ** attempt)
+            logger.warning(
+                "Search attempt %d/%d failed: %s — retrying in %.1fs",
+                attempt + 1, max_retries, exc, wait,
+            )
+            time.sleep(wait)
+    raise last_exc
 
 
 # ─── Agent ────────────────────────────────────────────────────────────────────
@@ -63,6 +110,7 @@ def run_search_agent(state: GrocerAIState) -> GrocerAIState:
     For each needed item, searches Kroger for matching products.
     Applies brand preference boosting from the RAG preference store.
     Results are sorted: preferred brands first, then by unit price.
+    Missing items are surfaced to the user with substitute suggestions.
     """
     needed_items = [n for n in state["grocery_needs"] if n["needed"]]
 
@@ -77,15 +125,17 @@ def run_search_agent(state: GrocerAIState) -> GrocerAIState:
     brand_prefs: list[str] = [b.lower() for b in preferences.get("preferred_brands", [])]
     avoid_brands: list[str] = [b.lower() for b in preferences.get("avoid_brands", [])]
     location_id = state.get("location_id") or settings.kroger_location_id
+    budget = state.get("budget")  # optional budget constraint
 
     search_results: dict[str, list[ProductResult]] = {}
     kroger_total = 0.0
+    not_found_items: list[str] = []
 
-    # Run searches concurrently (one thread per item, capped at 5)
+    # Run searches concurrently (capped at 5 threads)
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_item = {
             executor.submit(
-                _search_item,
+                _search_item_with_retry,
                 kroger,
                 need,
                 location_id,
@@ -100,30 +150,70 @@ def run_search_agent(state: GrocerAIState) -> GrocerAIState:
             try:
                 results = future.result()
                 search_results[need["name"]] = results
-                # Add cheapest matching product to store total
+
                 if results:
-                    kroger_total += results[0]["price"]  # uses estimated price if sandbox
+                    kroger_total += results[0]["price"]
+                else:
+                    # Item not found — surface to user with substitutes
+                    not_found_items.append(need["name"])
+                    subs = _get_substitutes(need["name"])
+                    if subs:
+                        state["warnings"].append(
+                            f"'{need['name']}' not found on Kroger. "
+                            f"Consider: {', '.join(subs)}"
+                        )
+                    else:
+                        state["warnings"].append(
+                            f"'{need['name']}' not found on Kroger — try searching manually."
+                        )
+
             except Exception as exc:
                 logger.warning("Search failed for '%s': %s", need["name"], exc)
-                state["warnings"].append(f"Search: could not find '{need['name']}'")
+                state["warnings"].append(
+                    f"Could not search for '{need['name']}' — API error. Try again later."
+                )
                 search_results[need["name"]] = []
+
+    # Budget enforcement: warn if over budget
+    if budget and kroger_total > budget:
+        over = kroger_total - budget
+        state["warnings"].append(
+            f"Estimated total ${kroger_total:.2f} exceeds your budget of ${budget:.2f} "
+            f"(${over:.2f} over). Consider removing low-priority items."
+        )
 
     state["search_results"] = search_results
     state["price_summary"] = {"kroger": round(kroger_total, 2)}
 
     found = sum(1 for r in search_results.values() if r)
     logger.info(
-        "Search Agent: found products for %d/%d items | kroger_est=$%.2f",
+        "Search Agent: found %d/%d items | not_found=%s | kroger_est=$%.2f",
         found,
         len(needed_items),
+        not_found_items,
         kroger_total,
     )
 
     return state
 
 
+def _search_item_with_retry(
+    kroger: KrogerClient,
+    need: GroceryNeed,
+    location_id: str,
+    brand_prefs: list[str],
+    avoid_brands: list[str],
+) -> list[ProductResult]:
+    """Search a single item with retry logic."""
+    return _with_retry(
+        lambda: _search_item(kroger, need, location_id, brand_prefs, avoid_brands),
+        max_retries=3,
+        base_delay=1.0,
+    )
+
+
 def _search_item(
-    kroger: "KrogerClient",
+    kroger: KrogerClient,
     need: GroceryNeed,
     location_id: str,
     brand_prefs: list[str],
@@ -146,28 +236,16 @@ def _search_item(
 
         preferred = any(pref in brand for pref in brand_prefs)
 
-        # DEBUG — log raw item structure to see what Kroger actually returns
-        import logging as _log
-        _log.getLogger(__name__).warning("KROGER RAW ITEM: %s", str(item)[:500])
-
-        # Extract price safely — try all Kroger price fields
+        # Extract price safely from Kroger response structure
         price_info = item.get("items", [{}])[0] if item.get("items") else {}
-        _log.getLogger(__name__).warning("KROGER PRICE_INFO: %s", str(price_info)[:300])
         price_obj = price_info.get("price") or {}
-        # DEBUG — log full item structure to see what Kroger returns
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "KROGER RAW ITEM: items=%s price_obj=%s",
-            str(item.get("items", []))[:500],
-            str(price_obj)[:200]
-        )
         price = float(
-            price_obj.get("regular") or
-            price_obj.get("promo") or
-            price_obj.get("regularPerUnitEstimate") or
-            item.get("regularPrice") or
-            item.get("price") or
-            0
+            price_obj.get("regular")
+            or price_obj.get("promo")
+            or price_obj.get("regularPerUnitEstimate")
+            or item.get("regularPrice")
+            or item.get("price")
+            or 0
         )
 
         # Extract size for unit price calculation
@@ -186,6 +264,7 @@ def _search_item(
                 image_url=_extract_image(item),
                 in_stock=item.get("aisleLocations") is not None,
                 preferred=preferred,
+                price_estimated=False,
             )
         )
 
@@ -196,15 +275,15 @@ def _search_item(
             if estimated > 0:
                 p["price"] = estimated
                 p["unit_price"] = _calc_unit_price(estimated, "16 oz")
-                p["price_estimated"] = True  # flag so UI can show ~$x.xx
+                p["price_estimated"] = True
 
-    # Sort: preferred first, then by unit price ascending
+    # Ranking strategy: preferred brand first, then unit price ascending
+    # This is explicit and documented — not random
     products.sort(key=lambda p: (not p["preferred"], p["unit_price"]))
     return products
 
 
 def _calc_unit_price(price: float, size_str: str) -> float:
-    """Attempt to calculate price-per-oz or price-per-unit from size string."""
     if not price:
         return 0.0
     try:

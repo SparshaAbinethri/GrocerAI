@@ -1,20 +1,20 @@
 """
 rag/preference_store.py
-FAISS-backed preference store for persisting and retrieving user preferences:
-  - preferred brands
-  - avoided brands
-  - dietary restrictions
-  - quality notes
-  - shopping history context
+FAISS-backed preference store for persisting and retrieving user preferences.
 
-On first run, initialises an empty FAISS index.
-On subsequent runs, loads the persisted index from disk.
+Fixes applied:
+  - Stale embeddings: delete + re-embed on preference update (no contradictory chunks)
+  - Metadata filtering on retrieval to ensure correct user's prefs are returned
+  - Retrieval logging for verification
+  - Structured preference schema with explicit override logic for conflicts
+  - Thread-safe save with file lock to prevent corruption on concurrent writes
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,8 @@ from langchain_openai import OpenAIEmbeddings
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+_save_lock = threading.Lock()
 
 
 # ─── Preference document templates ───────────────────────────────────────────
@@ -60,7 +62,10 @@ class PreferenceStore:
       {faiss_index_path}/
         index.faiss       — FAISS binary index
         index.pkl         — docstore + metadata
-        preferences.json  — raw JSON preferences keyed by user_id
+        preferences.json  — raw JSON preferences keyed by user_id (source of truth)
+
+    The JSON file is the source of truth for fast exact lookups.
+    FAISS is used only for semantic similarity search across all users.
     """
 
     def __init__(self) -> None:
@@ -74,7 +79,7 @@ class PreferenceStore:
         self._store: FAISS | None = None
         self._raw_prefs: dict[str, dict] = self._load_raw_prefs()
 
-    # ── Raw JSON preferences (fast lookup) ───────────────────────────────────
+    # ── Raw JSON preferences (fast lookup — source of truth) ─────────────────
 
     def _load_raw_prefs(self) -> dict[str, dict]:
         if self._prefs_file.exists():
@@ -85,9 +90,14 @@ class PreferenceStore:
         return {}
 
     def _save_raw_prefs(self) -> None:
-        self._prefs_file.write_text(json.dumps(self._raw_prefs, indent=2))
+        """Thread-safe write to preferences JSON file."""
+        with _save_lock:
+            # Write to temp file first, then rename (atomic on most filesystems)
+            tmp = self._prefs_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._raw_prefs, indent=2))
+            tmp.replace(self._prefs_file)
 
-    # ── FAISS index (semantic search) ─────────────────────────────────────────
+    # ── FAISS index (semantic search across users) ────────────────────────────
 
     def _load_or_create_store(self) -> FAISS:
         if self._store is not None:
@@ -116,43 +126,101 @@ class PreferenceStore:
         logger.info("Created new FAISS index at %s", self._index_path)
         return self._store
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def get_preferences(self, user_id: str) -> dict[str, Any]:
+    def _rebuild_user_embedding(self, user_id: str, prefs: dict) -> None:
         """
-        Returns user preferences dict. Fast path uses raw JSON;
-        falls back to empty defaults if user not found.
+        Delete all existing embeddings for a user and re-embed fresh.
+        This prevents stale/contradictory preference chunks from persisting.
         """
-        return self._raw_prefs.get(user_id, _default_preferences())
-
-    def save_preferences(self, user_id: str, prefs: dict[str, Any]) -> None:
-        """
-        Persist user preferences to both JSON (fast lookup) and FAISS (semantic).
-        """
-        # Validate and merge with defaults
-        merged = {**_default_preferences(), **prefs}
-        self._raw_prefs[user_id] = merged
-        self._save_raw_prefs()
-
-        # Upsert into FAISS
-        doc_text = _pref_to_doc(user_id, merged)
         store = self._load_or_create_store()
+
+        # Find and delete all existing docs for this user
+        try:
+            docstore = store.docstore._dict
+            ids_to_delete = [
+                doc_id for doc_id, doc in docstore.items()
+                if doc.metadata.get("user_id") == user_id
+            ]
+            if ids_to_delete:
+                store.delete(ids_to_delete)
+                logger.debug(
+                    "Deleted %d stale embedding(s) for user %s",
+                    len(ids_to_delete), user_id,
+                )
+        except Exception as exc:
+            logger.warning("Could not delete stale embeddings: %s", exc)
+
+        # Add fresh embedding
+        doc_text = _pref_to_doc(user_id, prefs)
         store.add_texts(
             [doc_text],
             metadatas=[{"user_id": user_id, "type": "preferences"}],
         )
         store.save_local(str(self._index_path))
-        logger.info("Saved preferences for user %s", user_id)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_preferences(self, user_id: str) -> dict[str, Any]:
+        """
+        Returns user preferences dict from JSON (fast exact lookup).
+        Logs what was retrieved so we can verify correctness.
+        Falls back to defaults if user not found.
+        """
+        prefs = self._raw_prefs.get(user_id, _default_preferences())
+
+        logger.debug(
+            "Preferences retrieved | user=%s brands=%s dietary=%s",
+            user_id,
+            prefs.get("preferred_brands", []),
+            prefs.get("dietary_restrictions", []),
+        )
+
+        return prefs
+
+    def save_preferences(self, user_id: str, prefs: dict[str, Any]) -> None:
+        """
+        Persist user preferences to both JSON (fast lookup) and FAISS (semantic).
+        Resolves conflicts before saving:
+          - If 'vegan' in dietary, adds 'dairy-free' implicitly
+          - Removes brands from preferred if they appear in avoid (avoid wins)
+        """
+        # Resolve conflicts before saving
+        merged = {**_default_preferences(), **prefs}
+        merged = _resolve_preference_conflicts(merged)
+
+        self._raw_prefs[user_id] = merged
+        self._save_raw_prefs()
+
+        # Rebuild FAISS embedding (delete stale, add fresh)
+        try:
+            self._rebuild_user_embedding(user_id, merged)
+        except Exception as exc:
+            logger.warning("FAISS update failed (preferences still saved to JSON): %s", exc)
+
+        logger.info(
+            "Saved preferences for user %s | brands=%s dietary=%s",
+            user_id,
+            merged.get("preferred_brands", []),
+            merged.get("dietary_restrictions", []),
+        )
 
     def search_similar_preferences(self, query: str, k: int | None = None) -> list[dict]:
         """
-        Semantic search across all user preferences.
-        Useful for admin/analytics or finding users with similar dietary needs.
+        Semantic search across all user preferences with metadata filtering.
+        Only returns actual user preference docs (not system docs).
         """
         store = self._load_or_create_store()
         k = k or settings.rag_top_k
-        docs = store.similarity_search(query, k=k)
-        return [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs]
+
+        # Filter to only user preference docs
+        docs = store.similarity_search(
+            query,
+            k=k,
+            filter={"type": "preferences"},
+        )
+
+        results = [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs]
+        logger.debug("Semantic search '%s' returned %d docs", query, len(results))
+        return results
 
     def update_preference(self, user_id: str, key: str, value: Any) -> None:
         """Update a single preference key for a user."""
@@ -163,17 +231,19 @@ class PreferenceStore:
     def add_brand_preference(self, user_id: str, brand: str, prefer: bool = True) -> None:
         """Convenience: add a brand to preferred or avoided list."""
         prefs = self.get_preferences(user_id)
+        brand_lower = brand.lower()
         if prefer:
             brands = set(prefs.get("preferred_brands", []))
-            brands.add(brand.lower())
+            brands.add(brand_lower)
             prefs["preferred_brands"] = sorted(brands)
-            # Remove from avoid list if present
-            prefs["avoid_brands"] = [b for b in prefs.get("avoid_brands", []) if b != brand.lower()]
+            # Remove from avoid list if present (prefer wins over old avoid)
+            prefs["avoid_brands"] = [b for b in prefs.get("avoid_brands", []) if b != brand_lower]
         else:
             brands = set(prefs.get("avoid_brands", []))
-            brands.add(brand.lower())
+            brands.add(brand_lower)
             prefs["avoid_brands"] = sorted(brands)
-            prefs["preferred_brands"] = [b for b in prefs.get("preferred_brands", []) if b != brand.lower()]
+            # Avoid always wins — remove from preferred
+            prefs["preferred_brands"] = [b for b in prefs.get("preferred_brands", []) if b != brand_lower]
         self.save_preferences(user_id, prefs)
 
     def add_dietary_restriction(self, user_id: str, restriction: str) -> None:
@@ -195,3 +265,32 @@ def _default_preferences() -> dict[str, Any]:
         "quality_notes": "",
         "notes": "",
     }
+
+
+def _resolve_preference_conflicts(prefs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Resolve contradictory preferences before saving.
+    Rules (explicit override logic):
+      - avoid_brands always wins over preferred_brands
+      - vegan implies dairy-free
+      - vegan implies vegetarian
+    """
+    dietary = set(prefs.get("dietary_restrictions", []))
+    preferred = set(prefs.get("preferred_brands", []))
+    avoid = set(prefs.get("avoid_brands", []))
+
+    # avoid always wins over preferred
+    conflicts = preferred & avoid
+    if conflicts:
+        logger.info("Removing from preferred (also in avoid): %s", conflicts)
+        preferred -= conflicts
+
+    # vegan implies dairy-free and vegetarian
+    if "vegan" in dietary:
+        dietary.add("dairy-free")
+        dietary.add("vegetarian")
+
+    prefs["preferred_brands"] = sorted(preferred)
+    prefs["avoid_brands"] = sorted(avoid)
+    prefs["dietary_restrictions"] = sorted(dietary)
+    return prefs
